@@ -2604,6 +2604,7 @@ class VllmConfig:
         if (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.is_kv_transfer_instance
+            and not self.cache_config.use_kda_recoverssm
         ):
             raise ValueError(
                 "--use-replayssm is incompatible with KV connectors "

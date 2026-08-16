@@ -82,6 +82,15 @@ def test_kda_recoverssm_derivation_is_revalidated():
     config.parallel_config.pipeline_parallel_size = 2
     with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
         VllmConfig.validate_mamba_cached_kernel(config)
+    config.parallel_config.pipeline_parallel_size = 1
+
+    config.kv_transfer_config = SimpleNamespace(is_kv_transfer_instance=True)
+    VllmConfig.validate_mamba_cached_kernel(config)
+    assert config.cache_config.use_kda_recoverssm
+
+    config.num_speculative_tokens = 0
+    with pytest.raises(ValueError, match="incompatible with KV connectors"):
+        VllmConfig.validate_mamba_cached_kernel(config)
 
 
 def test_compile_config_repr_succeeds():
