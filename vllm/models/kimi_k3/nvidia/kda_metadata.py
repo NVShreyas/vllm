@@ -304,6 +304,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.layer_names = layer_names
         self.use_recoverssm = vllm_config.cache_config.use_kda_recoverssm
         self.spec_state_slots = 1 if self.use_recoverssm else self.num_spec + 1
         self.recoverssm_num_accepted_tokens: torch.Tensor | None = None
@@ -373,10 +374,12 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             if self.use_recoverssm:
                 assert m.is_prefilling is not None
                 assert m.is_prefilling.device.type == "cpu"
+                query_lens_cpu = query_start_loc_cpu.diff()
                 active_decode_mask_cpu = (~m.is_prefilling) & (
-                    query_start_loc_cpu.diff() > 0
+                    query_lens_cpu > 0
                 )
                 spec_sequence_masks_cpu |= active_decode_mask_cpu
+                spec_sequence_masks_cpu &= query_lens_cpu <= self.num_spec + 1
             # Native KDA can use its regular decode path when no draft token
             # was scheduled. RecoverSSM must preserve its extended conv window.
             if (

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import fields
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -446,6 +446,39 @@ def test_recoverssm_spec_cudagraph_stages_one_checkpoint_per_request():
     )
     assert actual.recoverssm_commit is not None
     assert actual.recoverssm_commit.request_indices is None
+
+
+def test_recoverssm_piecewise_capture_uses_prefill_above_activation_capacity():
+    device = torch.device("cpu")
+    batch = BatchSpec(seq_lens=[8, 8], query_lens=[8, 8])
+    common_attn_metadata = create_common_attn_metadata(
+        batch, BLOCK_SIZE, device
+    ).replace(is_prefilling=torch.tensor([False, False]))
+    with patch("vllm.platforms.current_platform.device_type", "cpu"):
+        builder = _make_builder(
+            KimiK3KDAMetadataBuilder,
+            num_speculative_tokens=2,
+            full_cuda_graph=False,
+            device=device,
+            use_recoverssm=True,
+        )
+
+    with (
+        patch("vllm.utils.torch_utils.PIN_MEMORY", False),
+        patch("vllm.v1.attention.backends.utils.PIN_MEMORY", False),
+    ):
+        assert builder.layer_names == ["layer.0"]
+        actual = builder.build(
+            0,
+            common_attn_metadata,
+            num_decode_draft_tokens_cpu=torch.full((2,), -1, dtype=torch.int32),
+            num_accepted_tokens=torch.ones(2, dtype=torch.int32, device=device),
+        )
+
+    assert actual.num_spec_decodes == 0
+    assert actual.num_prefills == 2
+    assert actual.num_prefill_tokens == 16
+    assert actual.recoverssm_commit is None
 
 
 def test_kimi_k3_kda_backend_uses_private_metadata_builder():
