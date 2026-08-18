@@ -1089,23 +1089,7 @@ class KimiDecoderLayer(nn.Module):
         return hidden_states, prefix_sum, residual
 
 
-def _should_create_kimi_embedding(vllm_config: VllmConfig) -> bool:
-    pp_group = get_pp_group()
-    if pp_group.is_first_rank:
-        return True
-
-    speculative_config = vllm_config.speculative_config
-    return (
-        pp_group.is_last_rank
-        and vllm_config.parallel_config.pipeline_parallel_size > 1
-        and speculative_config is not None
-        and speculative_config.method == "dspark"
-    )
-
-
 class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
-    _AUX_HIDDEN_STATE_PREFIX = "aux_hidden_states."
-
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "in_proj_qkvgfab": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"],
@@ -1135,7 +1119,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # ranks to belong to one NVLink domain.
         self.run_gemm_rs = maybe_init_gemm_rs(vllm_config, self.use_sequence_parallel)
 
-        if _should_create_kimi_embedding(vllm_config):
+        if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -1207,24 +1191,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 cdiv(self.start_layer, self.attn_res_block_size),
                 self.config.hidden_size,
             )
-        tensors = {
-            "hidden_states": torch.zeros(
-                (batch_size, self.config.hidden_size), dtype=dtype, device=device
-            ),
-            "residual": torch.zeros(residual_shape, dtype=dtype, device=device),
-        }
-        # The draft model lives on the last PP rank, so selected hidden states
-        # from earlier stages must travel with the regular intermediate tensors.
-        for layer_idx in self.aux_hidden_state_layers:
-            if layer_idx <= self.start_layer:
-                tensors[self._aux_hidden_state_key(layer_idx)] = torch.zeros(
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
                     (batch_size, self.config.hidden_size), dtype=dtype, device=device
-                )
-        return IntermediateTensors(tensors)
-
-    @classmethod
-    def _aux_hidden_state_key(cls, layer_idx: int) -> str:
-        return f"{cls._AUX_HIDDEN_STATE_PREFIX}{layer_idx}"
+                ),
+                "residual": torch.zeros(residual_shape, dtype=dtype, device=device),
+            }
+        )
 
     def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         super()._set_aux_hidden_state_layers(layers)
@@ -1328,22 +1302,6 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             residual = intermediate_tensors["residual"]
         assert hidden_states is not None
 
-        aux_hidden_states: dict[int, torch.Tensor] = {}
-        if intermediate_tensors is not None:
-            for layer_idx in self.aux_hidden_state_layers:
-                key = self._aux_hidden_state_key(layer_idx)
-                if key in intermediate_tensors.tensors:
-                    aux_hidden_states[layer_idx] = intermediate_tensors[key]
-
-        if (
-            self.start_layer in self.aux_hidden_state_layers
-            and self.start_layer not in aux_hidden_states
-        ):
-            if self.use_attn_res or residual is None:
-                aux_hidden_states[self.start_layer] = hidden_states
-            else:
-                aux_hidden_states[self.start_layer] = hidden_states + residual
-
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
@@ -1353,6 +1311,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 )
             hidden_states = sp_shard(hidden_states)
             assert residual is None, "Currently, SP is not supported with PP"
+
+        # sharded aux hidden states when sp is enabled
+        aux_hidden_states: list[torch.Tensor] = []
+        if self.start_layer in self.aux_hidden_state_layers:
+            if self.use_attn_res or residual is None:
+                aux_hidden_states.append(hidden_states)
+            else:
+                aux_hidden_states.append(hidden_states + residual)
 
         prefix_sum = None
         if self.use_attn_res:
@@ -1388,7 +1354,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     assert residual is not None
                     aux_hidden_state = hidden_states + residual
 
-                aux_hidden_states[layer_idx + 1] = aux_hidden_state
+                aux_hidden_states.append(aux_hidden_state)
 
         assert hidden_states is not None
         assert residual is not None
@@ -1398,14 +1364,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             )
             if prefix_sum is not None:
                 hidden_states = hidden_states + prefix_sum
-            tensors = {"hidden_states": hidden_states, "residual": residual}
-            for layer_idx in self.aux_hidden_state_layers:
-                if layer_idx <= self.end_layer:
-                    assert layer_idx in aux_hidden_states
-                    tensors[self._aux_hidden_state_key(layer_idx)] = aux_hidden_states[
-                        layer_idx
-                    ]
-            return IntermediateTensors(tensors)
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
 
         if self.use_attn_res:
             assert prefix_sum is not None
@@ -1427,20 +1388,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         if self.use_sequence_parallel:
             if aux_hidden_states:
                 hidden_size = hidden_states.shape[-1]
-                ordered_aux_hidden_states = [
-                    aux_hidden_states[layer_idx]
-                    for layer_idx in self.aux_hidden_state_layers
-                ]
                 packed_hidden_states = torch.cat(
-                    [hidden_states, *ordered_aux_hidden_states], dim=-1
+                    [hidden_states, *aux_hidden_states], dim=-1
                 )
                 packed_hidden_states = sp_all_gather(packed_hidden_states)
                 packed_hidden_states = packed_hidden_states[:full_num_tokens]
-                hidden_states, *ordered_aux_hidden_states = packed_hidden_states.split(
+                hidden_states, *aux_hidden_states = packed_hidden_states.split(
                     hidden_size, dim=-1
-                )
-                aux_hidden_states = dict(
-                    zip(self.aux_hidden_state_layers, ordered_aux_hidden_states)
                 )
             else:
                 hidden_states = sp_all_gather(hidden_states)
@@ -1449,10 +1403,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # NOTE: the final norm is applied in compute_logits instead of here, so
         # the MTP draft model receives the pre-norm hidden states.
         if aux_hidden_states:
-            return hidden_states, [
-                aux_hidden_states[layer_idx]
-                for layer_idx in self.aux_hidden_state_layers
-            ]
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(
