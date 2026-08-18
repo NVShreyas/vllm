@@ -27,6 +27,7 @@ from vllm.model_executor.models.utils import (
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.model import KimiMLP
+from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -470,7 +471,13 @@ class K3DSparkForCausalLM(nn.Module, SupportsPP):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
+        *,
+        intermediate_tensors: IntermediateTensors | None = None,
     ) -> torch.Tensor:
+        # The complete draft is hosted on the last target PP rank, so it never
+        # consumes pipeline intermediates of its own. Keep the keyword in the
+        # signature to satisfy the current SupportsPP structural interface.
+        assert intermediate_tensors is None
         return self.model(input_ids, positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
