@@ -1509,6 +1509,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
             )
+            # Idle DP ranks still participate in DCP attention collectives.
+            # Populate the rank-local lengths for their dummy batches just as
+            # for real batches; leaving this field unset breaks DCP metadata
+            # construction when another DP rank has scheduled work.
+            if self.use_dcp:
+                prepare_dcp_local_seq_lens(
+                    self.input_buffers.dcp_local_seq_lens,
+                    input_batch.seq_lens,
+                    input_batch.num_reqs,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    self.cp_interleave,
+                )
+                input_batch.dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[
+                    : input_batch.num_reqs_after_padding
+                ]
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
                 if context_len:
