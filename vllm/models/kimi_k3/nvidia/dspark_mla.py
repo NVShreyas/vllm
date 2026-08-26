@@ -13,6 +13,7 @@ from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -23,6 +24,7 @@ from vllm.model_executor.models.utils import (
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.model import KimiMLP
+from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import is_quantized_kv_cache
 
 
@@ -428,7 +430,7 @@ class K3DSparkModel(nn.Module):
         return hidden_states
 
 
-class K3DSparkForCausalLM(nn.Module):
+class K3DSparkForCausalLM(nn.Module, SupportsPP):
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
@@ -449,15 +451,12 @@ class K3DSparkForCausalLM(nn.Module):
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
-        target_layer_num = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
+        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.model = K3DSparkModel(
             vllm_config=vllm_config,
             start_layer_id=target_layer_num,
             prefix=maybe_prefix(prefix, "model"),
         )
-
         # Assigned by load_dspark_model from the target. Keeping no placeholder
         # avoids a transient full-vocabulary allocation for this 163k-vocab model.
         self.lm_head: nn.Module | None = None
@@ -475,6 +474,22 @@ class K3DSparkForCausalLM(nn.Module):
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.layer_name for layer in self.model.layers]
 
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.config.hidden_size),
+                    dtype=dtype,
+                    device=device,
+                )
+            }
+        )
+
     def precompute_and_store_context_kv(
         self,
         context_states: torch.Tensor,
@@ -487,10 +502,14 @@ class K3DSparkForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
+        *,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        assert intermediate_tensors is None
+        assert input_ids is not None or inputs_embeds is not None
         return self.model(input_ids, positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
