@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 
 def _markov_head(weight: torch.Tensor) -> DSparkMarkovHead:
@@ -15,6 +16,29 @@ def _markov_head(weight: torch.Tensor) -> DSparkMarkovHead:
     )
     head.markov_w2.weight.data.copy_(weight)
     return head
+
+
+def test_anchor_sampling_uses_contiguous_hidden_rows():
+    speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+    speculator.sample_from_anchor = True
+    # Deliberately stale values must not affect the anchor identity mapping.
+    speculator.sample_indices = torch.tensor([3, 2, 1, 0])
+    hidden = torch.arange(12).view(6, 2)
+
+    result = speculator._select_sample_hidden(hidden, 4)
+
+    torch.testing.assert_close(result, hidden[:4])
+
+
+def test_non_anchor_sampling_gathers_hidden_rows():
+    speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+    speculator.sample_from_anchor = False
+    speculator.sample_indices = torch.tensor([3, 1, 4, 0])
+    hidden = torch.arange(12).view(6, 2)
+
+    result = speculator._select_sample_hidden(hidden, 3)
+
+    torch.testing.assert_close(result, hidden[[3, 1, 4]])
 
 
 def test_gathered_markov_bias_overwrites_dense_logits():

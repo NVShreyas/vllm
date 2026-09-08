@@ -85,6 +85,25 @@ class PPHandler:
         self.broadcast_group = get_pp_group().make_sibling_device_group(
             group_desc="pp_broadcast"
         )
+        # NCCL broadcasts are enqueued asynchronously. Keep their source
+        # storage persistent instead of allocating per-step temporaries that
+        # the caching allocator can recycle before the collective consumes
+        # them. Reuse is ordered by broadcast_stream.
+        self.send_sampled_tokens = (
+            torch.empty(
+                max_num_reqs,
+                self.max_sample_len,
+                dtype=torch.int64,
+                device=device,
+            )
+            if self.is_last_rank
+            else None
+        )
+        self.send_metadata = (
+            torch.empty(2 * max_num_reqs, dtype=torch.int32, device=device)
+            if self.is_last_rank
+            else None
+        )
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
 
     def on_req_idx_freed(self, req_idx: int) -> None:
@@ -127,6 +146,12 @@ class PPHandler:
         if slot is None:
             return None
 
+        # Always order the main stream after the receive, even when every row
+        # is filtered below. The receive buffers were recorded on main_stream;
+        # returning before this wait can let the allocator recycle them while
+        # NCCL is still writing the slot.
+        self.main_stream.wait_event(slot.event)
+
         # Skip requests which did not need sampled output and/or those already
         # finished. The post_update kernel skips the -1 entries.
         freed = self.req_idx_gen_np[slot.idx_mapping_np] != slot.gen_at_receive_np
@@ -140,7 +165,6 @@ class PPHandler:
             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
-        self.main_stream.wait_event(slot.event)
         if slot.draft_tokens is not None and draft_tokens_to_update is not None:
             draft_tokens = slot.draft_tokens
             draft_idx_mapping = slot.idx_mapping
@@ -167,9 +191,13 @@ class PPHandler:
         assert self.is_last_rank
         if compute_need_sampled_mask(input_batch) is None:
             return
+        current_stream = torch.cuda.current_stream(self.device)
+        # Snapshot the rows while idx_mapping still belongs to this execution
+        # step. The temporary's lifetime is extended through the asynchronous
+        # NCCL broadcast below.
+        send = draft_tokens[input_batch.idx_mapping].contiguous()
         with torch.cuda.stream(self.broadcast_stream):
-            self.broadcast_stream.wait_stream(self.main_stream)
-            send = draft_tokens[input_batch.idx_mapping].contiguous()
+            self.broadcast_stream.wait_stream(current_stream)
             torch.distributed.broadcast(
                 send, src=self.last_rank, group=self.broadcast_group
             )
@@ -252,16 +280,25 @@ class PPHandler:
 
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
-            send_tokens = torch.nn.functional.pad(
-                sampled_token_ids,
-                (0, self.max_sample_len - sampled_token_ids.shape[-1]),
-            )
+            num_reqs = input_batch.num_reqs
+            assert sampled_token_ids.shape[0] == num_reqs
+            assert self.send_sampled_tokens is not None
+            assert self.send_metadata is not None
+
+            # Copy into persistent, contiguous buffers. Pad sampled tokens to
+            # max_sample_len so the send width matches receive().
+            send_tokens = self.send_sampled_tokens[:num_reqs]
+            send_tokens.zero_()
+            width = sampled_token_ids.shape[-1]
+            send_tokens[:, :width].copy_(sampled_token_ids)
             torch.distributed.broadcast(
-                send_tokens.contiguous(),
+                send_tokens,
                 src=self.last_rank,
                 group=self.broadcast_group,
             )
-            combined = torch.stack((num_sampled, num_rejected), dim=0)
+            combined = self.send_metadata[: 2 * num_reqs].view(2, num_reqs)
+            combined[0].copy_(num_sampled)
+            combined[1].copy_(num_rejected)
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
