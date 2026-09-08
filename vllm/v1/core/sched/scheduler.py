@@ -97,6 +97,14 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
+        additional_config = vllm_config.additional_config
+        self.pp_async_decode_batch_size = (
+            int(additional_config.get("pp_async_decode_batch_size", 0))
+            if isinstance(additional_config, dict)
+            else 0
+        )
+        if self.pp_async_decode_batch_size < 0:
+            raise ValueError("pp_async_decode_batch_size must be non-negative")
         self.log_stats = log_stats
         self.observability_config = vllm_config.observability_config
         self.spec_decode_metrics_level = (
@@ -576,6 +584,7 @@ class Scheduler(SchedulerInterface):
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
+        scheduled_output_req_ids: set[str] = set()
         preempted_reqs: list[Request] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
@@ -725,6 +734,18 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            produces_output = (
+                request.num_computed_tokens + num_new_tokens
+                >= request.num_prompt_tokens
+            )
+            if (
+                produces_output
+                and self.pp_async_decode_batch_size > 0
+                and len(scheduled_output_req_ids) >= self.pp_async_decode_batch_size
+            ):
+                req_index += 1
+                continue
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -759,6 +780,7 @@ class Scheduler(SchedulerInterface):
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                            scheduled_output_req_ids.discard(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
@@ -797,6 +819,8 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if produces_output:
+                scheduled_output_req_ids.add(request_id)
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
@@ -1121,6 +1145,20 @@ class Scheduler(SchedulerInterface):
                         # The request cannot be scheduled.
                         break
 
+                produces_output = (
+                    not load_kv_async
+                    and num_computed_tokens + num_new_tokens
+                    >= request.num_prompt_tokens
+                )
+                if (
+                    produces_output
+                    and self.pp_async_decode_batch_size > 0
+                    and len(scheduled_output_req_ids) >= self.pp_async_decode_batch_size
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
                 # mismatching local and remote block counts.
@@ -1252,6 +1290,8 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if produces_output:
+                    scheduled_output_req_ids.add(request_id)
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING

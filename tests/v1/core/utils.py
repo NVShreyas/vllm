@@ -74,6 +74,7 @@ def create_scheduler(
     use_v2_model_runner: bool | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
     per_request_spec_decode_metrics: str = "none",
+    additional_config: dict | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -186,6 +187,7 @@ def create_scheduler(
         observability_config=ObservabilityConfig(
             per_request_spec_decode_metrics=per_request_spec_decode_metrics,
         ),
+        additional_config=additional_config or {},
     )
     if kv_cache_spec is None:
         kv_cache_spec = FullAttentionSpec(

@@ -109,6 +109,41 @@ def test_no_spec_decode_padding_up_to_max_model_len():
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
 
 
+def test_pp_async_decode_batch_size_balances_cadence_groups():
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        max_num_seqs=32,
+        max_num_batched_tokens=8192,
+        num_speculative_tokens=7,
+        speculative_method="ngram_gpu",
+        use_v2_model_runner=True,
+        additional_config={"pp_async_decode_batch_size": 16},
+    )
+    scheduler.pp_size = 2
+    scheduler.use_pp = True
+
+    requests = create_requests(
+        num_requests=32,
+        num_tokens=1,
+        max_tokens=10,
+        ignore_eos=True,
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    first = scheduler.schedule()
+    second = scheduler.schedule()
+    scheduler.update_from_output(first, _make_model_runner_output(first))
+    third = scheduler.schedule()
+
+    first_ids = set(first.num_scheduled_tokens)
+    second_ids = set(second.num_scheduled_tokens)
+    third_ids = set(third.num_scheduled_tokens)
+    assert len(first_ids) == len(second_ids) == 16
+    assert first_ids.isdisjoint(second_ids)
+    assert third_ids == first_ids
+
+
 def test_abort():
     scheduler = create_scheduler(async_scheduling=True)
     requests = create_requests(num_requests=10, max_tokens=20)
