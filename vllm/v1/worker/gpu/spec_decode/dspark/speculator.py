@@ -150,17 +150,6 @@ class DSparkSpeculator(DFlashSpeculator):
             use_fp64=self.use_fp64_gumbel,
         )
 
-    def _select_sample_hidden(
-        self, head_hidden: torch.Tensor, num_sample: int
-    ) -> torch.Tensor:
-        """Select backbone rows consumed by the sequential Markov head."""
-        if self.sample_from_anchor:
-            # Every query row is sampled and the query layout is already
-            # contiguous (request, step). Avoid depending on the asynchronously
-            # prepared sample-index buffer for this identity mapping.
-            return head_hidden[:num_sample]
-        return head_hidden[self.sample_indices[:num_sample]]
-
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
@@ -169,7 +158,8 @@ class DSparkSpeculator(DFlashSpeculator):
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
-        sample_hidden = self._select_sample_hidden(head_hidden, num_sample)
+        # Per-(req, position) head hidden, ordered (req, step).
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
         base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]
@@ -216,7 +206,7 @@ class DSparkSpeculator(DFlashSpeculator):
         assert self._draft_topk is not None
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
-        sample_hidden = self._select_sample_hidden(head_hidden, num_sample)
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
         base_logits = self.model.compute_draft_logits(sample_hidden)
         base_logits = base_logits.view(num_reqs, n_spec, -1)
         base_values, draft_indices = base_logits.topk(self._draft_topk, dim=-1)
