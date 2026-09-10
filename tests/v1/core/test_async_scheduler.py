@@ -109,7 +109,7 @@ def test_no_spec_decode_padding_up_to_max_model_len():
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
 
 
-def test_pp_async_decode_batch_size_balances_cadence_groups():
+def test_pp_async_decode_batch_size_only_balances_decode_cadence_groups():
     scheduler = create_scheduler(
         async_scheduling=True,
         max_num_seqs=32,
@@ -131,14 +131,20 @@ def test_pp_async_decode_batch_size_balances_cadence_groups():
     for request in requests:
         scheduler.add_request(request)
 
-    first = scheduler.schedule()
-    second = scheduler.schedule()
-    scheduler.update_from_output(first, _make_model_runner_output(first))
-    third = scheduler.schedule()
+    prefill = scheduler.schedule()
+    bubble = scheduler.schedule()
+    scheduler.update_from_output(prefill, _make_model_runner_output(prefill))
+    first_decode = scheduler.schedule()
+    scheduler.update_from_output(bubble, _make_model_runner_output(bubble))
+    second_decode = scheduler.schedule()
+    scheduler.update_from_output(first_decode, _make_model_runner_output(first_decode))
+    third_decode = scheduler.schedule()
 
-    first_ids = set(first.num_scheduled_tokens)
-    second_ids = set(second.num_scheduled_tokens)
-    third_ids = set(third.num_scheduled_tokens)
+    assert len(prefill.num_scheduled_tokens) == 32
+    assert not bubble.num_scheduled_tokens
+    first_ids = set(first_decode.num_scheduled_tokens)
+    second_ids = set(second_decode.num_scheduled_tokens)
+    third_ids = set(third_decode.num_scheduled_tokens)
     assert len(first_ids) == len(second_ids) == 16
     assert first_ids.isdisjoint(second_ids)
     assert third_ids == first_ids

@@ -734,12 +734,9 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            produces_output = (
-                request.num_computed_tokens + num_new_tokens
-                >= request.num_prompt_tokens
-            )
+            is_decode = request.num_computed_tokens >= request.num_prompt_tokens
             if (
-                produces_output
+                is_decode
                 and self.pp_async_decode_batch_size > 0
                 and len(scheduled_output_req_ids) >= self.pp_async_decode_batch_size
             ):
@@ -819,7 +816,7 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
-            if produces_output:
+            if is_decode:
                 scheduled_output_req_ids.add(request_id)
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
@@ -1145,13 +1142,12 @@ class Scheduler(SchedulerInterface):
                         # The request cannot be scheduled.
                         break
 
-                produces_output = (
+                is_decode = (
                     not load_kv_async
-                    and num_computed_tokens + num_new_tokens
-                    >= request.num_prompt_tokens
+                    and num_computed_tokens >= request.num_prompt_tokens
                 )
                 if (
-                    produces_output
+                    is_decode
                     and self.pp_async_decode_batch_size > 0
                     and len(scheduled_output_req_ids) >= self.pp_async_decode_batch_size
                 ):
@@ -1290,7 +1286,7 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
-                if produces_output:
+                if is_decode:
                     scheduled_output_req_ids.add(request_id)
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
