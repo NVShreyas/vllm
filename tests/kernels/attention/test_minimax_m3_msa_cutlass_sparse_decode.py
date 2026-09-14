@@ -261,10 +261,17 @@ def test_msa_metadata_builder_prepares_cutlass_for_regular_decode(
         lambda *args, **kwargs: base_metadata,
     )
     expected_metadata = object()
+    prepared_seq_lens_cpu = None
+
+    def fake_prepare_decode_metadata(*args, **kwargs):
+        nonlocal prepared_seq_lens_cpu
+        prepared_seq_lens_cpu = args[2]
+        return expected_metadata
+
     monkeypatch.setattr(
         sparse_attention_msa_module,
         "prepare_decode_metadata",
-        lambda *args, **kwargs: expected_metadata,
+        fake_prepare_decode_metadata,
     )
 
     builder = object.__new__(MiniMaxM3SparseMSAMetadataBuilder)
@@ -279,13 +286,18 @@ def test_msa_metadata_builder_prepares_cutlass_for_regular_decode(
     metadata = builder.build(
         0,
         SimpleNamespace(
-            seq_lens_cpu_upper_bound=torch.full((batch,), 257, dtype=torch.int32)
+            seq_lens_cpu_upper_bound=torch.full((batch,), 257, dtype=torch.int32),
+            dcp_local_seq_lens_cpu=torch.full((batch,), 129, dtype=torch.int32),
         ),
     )
 
     assert isinstance(metadata.decode, MiniMaxM3SparseMSADecodeMetadata)
     assert metadata.decode.decode_query_len == 1
     assert metadata.decode.msa_cutlass is expected_metadata
+    assert prepared_seq_lens_cpu is not None
+    torch.testing.assert_close(
+        prepared_seq_lens_cpu, torch.full((batch,), 257, dtype=torch.int32)
+    )
 
 
 def test_msa_cutlass_plan_cache_keys_query_len(

@@ -15,6 +15,7 @@ from vllm.config import VllmConfig
 from vllm.config.attention import MiniMaxM3MSADecodeBackend
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.models.minimax_m3.common.dcp import minimax_m3_decode_seq_lens
 from vllm.models.minimax_m3.common.ops.sparse_attn import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_sparse_attn_decode,
@@ -120,6 +121,17 @@ class MiniMaxM3SparseMSAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
         decode = metadata.decode
         if decode is None:
             return metadata
+
+        # Only FlashInfer can provide the partial output and LSE required for
+        # DCP reduction. CUTLASS and Triton retain their global metadata and are
+        # rejected by the generic DCP compatibility check.
+        if (
+            self.decode_backend == "flashinfer"
+            and common_attn_metadata.dcp_local_seq_lens is not None
+        ):
+            decode.seq_lens = minimax_m3_decode_seq_lens(
+                common_attn_metadata, metadata.num_decodes
+            )
 
         msa_cutlass = None
         if should_prepare_decode_metadata(

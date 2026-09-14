@@ -28,6 +28,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.models.minimax_m3.common.dcp import minimax_m3_decode_seq_lens
 from vllm.models.minimax_m3.common.indexer import (
     MiniMaxM3IndexerBackend,
     MiniMaxM3IndexerDecodeMetadata,
@@ -170,6 +171,16 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         assert positions is not None
         num_valid_pages = self.num_valid_pages_buffer[:num_tokens]
         num_valid_pages.copy_(positions[:num_tokens] // PAGE_SIZE + 1)
+        if common_attn_metadata.dcp_local_seq_lens is not None:
+            # DCP currently forces uniform single-token decode. Decode rows are
+            # first, so each row's causal bound is its rank-local request length.
+            assert num_decode_tokens == num_decodes
+            local_decode_seq_lens = minimax_m3_decode_seq_lens(
+                common_attn_metadata, num_decodes
+            )
+            num_valid_pages[:num_decode_tokens].copy_(
+                (local_decode_seq_lens + PAGE_SIZE - 1) // PAGE_SIZE
+            )
 
         # Unified score buffer: a per-forward view of the persistent buffer,
         # reset to the -inf sentinel once here and shared by every layer (the
@@ -188,7 +199,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 (query_lens_cpu == decode_query_len) | (query_lens_cpu == 0)
             )
             decode = MiniMaxM3IndexerDecodeMetadata(
-                seq_lens=seq_lens[:num_decodes],
+                seq_lens=minimax_m3_decode_seq_lens(common_attn_metadata, num_decodes),
                 block_table=block_table[:num_decodes],
                 max_seq_len=common_attn_metadata.max_seq_len,
                 decode_query_len=decode_query_len,
