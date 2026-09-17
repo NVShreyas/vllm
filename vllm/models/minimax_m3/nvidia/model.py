@@ -643,7 +643,20 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         )
 
         output = torch.empty_like(q)
-        attn_output = self._run_attention(q, query_fp8, index_q, output)
+        current_key = current_value = None
+        if self.impl.need_to_return_lse_for_decode:
+            current_key = qkv[:, self.q_size : self.q_size + self.kv_size]
+            current_value = qkv[
+                :, self.q_size + self.kv_size : self.q_size + 2 * self.kv_size
+            ]
+        attn_output = self._run_attention(
+            q,
+            query_fp8,
+            index_q,
+            output,
+            current_key,
+            current_value,
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -654,10 +667,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         query_fp8: torch.Tensor | None,
         index_query: torch.Tensor,
         output: torch.Tensor,
+        current_key: torch.Tensor | None,
+        current_value: torch.Tensor | None,
     ) -> torch.Tensor:
-        # Single eager break around both: their split-K kernels read per-request
-        # metadata and can't be captured into a cudagraph. The indexer writes its
-        # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
+        # The indexer writes its top-k into the shared stable buffer; the
+        # attention kernel consumes it in the same graph-captured forward.
         self.indexer(index_query)
         return self.impl.forward(
             self,
@@ -665,6 +679,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.kv_cache,
             output,
             query_fp8=query_fp8,
+            current_key=current_key,
+            current_value=current_value,
         )
 
 

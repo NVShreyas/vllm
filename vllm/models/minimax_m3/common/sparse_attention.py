@@ -417,6 +417,8 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
         output: torch.Tensor,
         *,
         query_fp8: torch.Tensor | None = None,
+        current_key: torch.Tensor | None = None,
+        current_value: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Attend the queries to the indexer-selected blocks. Per kernel.
 
@@ -441,6 +443,8 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
         output: torch.Tensor,
         *,
         query_fp8: torch.Tensor | None = None,
+        current_key: torch.Tensor | None = None,
+        current_value: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):

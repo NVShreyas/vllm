@@ -1397,6 +1397,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def prepare_dummy_attn(
         self, input_batch: InputBatch, valid_state_slots: bool = False
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        if self.use_dcp:
+            # Unlike graph-capture dummy inputs, generic _dummy_run inputs do
+            # not pass through prepare_inputs(). Populate the device-resident
+            # local lengths needed by DCP attention metadata builders. This is
+            # exercised by model-specific kernel warmups before graph capture.
+            prepare_dcp_local_seq_lens(
+                self.input_buffers.dcp_local_seq_lens,
+                input_batch.seq_lens,
+                input_batch.num_reqs,
+                self.dcp_size,
+                self.dcp_rank,
+                self.cp_interleave,
+            )
+            input_batch.dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[
+                : input_batch.num_reqs
+            ]
         block_tables = self.block_tables.get_dummy_block_tables(input_batch.num_reqs)
         if valid_state_slots:
             state_slots = torch.arange(

@@ -115,6 +115,7 @@ def msa_flashinfer_sparse_decode(
     q_scale_float: float = 1.0,
     k_scale_float: float = 1.0,
     v_scale_float: float = 1.0,
+    causal: bool = True,
     out: torch.Tensor,
     lse_out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -142,7 +143,7 @@ def msa_flashinfer_sparse_decode(
         page_table=block_table,
         seqused_k=seq_lens,
         seqlen_q=decode_query_len,
-        causal=True,
+        causal=causal,
         softmax_scale=scale * q_scale_float,
         return_softmax_lse=True,
         k_global_scale=k_scale_float,

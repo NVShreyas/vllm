@@ -27,8 +27,12 @@ from typing import ClassVar
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
-from vllm.models.minimax_m3.common.dcp import minimax_m3_decode_seq_lens
+from vllm.models.minimax_m3.common.dcp import (
+    minimax_m3_dcp_prefill_segments,
+    minimax_m3_decode_seq_lens,
+)
 from vllm.models.minimax_m3.common.indexer import (
     MiniMaxM3IndexerBackend,
     MiniMaxM3IndexerDecodeMetadata,
@@ -39,7 +43,12 @@ from vllm.models.minimax_m3.common.indexer import (
 from vllm.models.minimax_m3.common.ops.index_topk import (
     minimax_m3_index_decode_score,
 )
-from vllm.models.minimax_m3.nvidia.ops import minimax_m3_index_decode_score_cutedsl
+from vllm.models.minimax_m3.nvidia.ops import (
+    force_dcp_global_blocks,
+    merge_filter_dcp_topk,
+    minimax_m3_index_decode_score_cutedsl,
+    write_dcp_local_seq_lens,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -108,6 +117,16 @@ class MiniMaxM3IndexerMSAMetadata(MiniMaxM3IndexerMetadata):
     # Per-token causal page count cdiv(seq_pos+1, PAGE_SIZE), [total_q] int32:
     # drives sparse_topk_select force_end_blocks + -1 out-of-range clamp.
     topk_num_valid_pages: torch.Tensor | None = None
+    # The corresponding model-global page counts. Under DCP the field above is
+    # rank-local for decode, while forced init/tail blocks retain global model
+    # semantics and therefore use this field to determine their owner.
+    topk_num_global_valid_pages: torch.Tensor | None = None
+    # Persistent scratch for this rank's packed (score, global-block-id)
+    # candidates. Only present when DCP is enabled.
+    dcp_packed_candidates: torch.Tensor | None = None
+    # Global position per decode query row. DQL>1 score kernels localize each
+    # row independently because interleaved DCP ownership is token-granular.
+    decode_positions: torch.Tensor | None = None
 
 
 class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
@@ -137,6 +156,35 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             dtype=torch.float32,
             device=device,
         )
+        parallel_config = vllm_config.parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        if self.dcp_world_size > 1:
+            # The exact-global-top-k checkpoint intentionally supports only the
+            # MiniMax deployment shape being validated first. Attention/LSE
+            # reduction is a separate checkpoint.
+            assert self.cp_kv_cache_interleave_size == PAGE_SIZE
+            assert self.num_index_heads == 1
+            self.dcp_rank = get_dcp_group().rank_in_group
+            hf_config = vllm_config.model_config.hf_config
+            text_config = getattr(hf_config, "text_config", hf_config)
+            sparse_cfg = text_config.sparse_attention_config
+            topk_blocks = sparse_cfg["sparse_topk_blocks"]
+            assert topk_blocks == 16
+            self.dcp_packed_candidates_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                topk_blocks,
+                2,
+                dtype=torch.float32,
+                device=device,
+            )
+            self.global_num_valid_pages_buffer = torch.empty_like(
+                self.num_valid_pages_buffer
+            )
+        else:
+            self.dcp_rank = 0
+            self.dcp_packed_candidates_buffer = None
+            self.global_num_valid_pages_buffer = self.num_valid_pages_buffer
 
     def build(
         self,
@@ -169,17 +217,20 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         # Per-token causal page count for the top-k, into the stable cg buffer.
         positions = common_attn_metadata.positions
         assert positions is not None
+        global_num_valid_pages = self.global_num_valid_pages_buffer[:num_tokens]
+        global_num_valid_pages.copy_(positions[:num_tokens] // PAGE_SIZE + 1)
         num_valid_pages = self.num_valid_pages_buffer[:num_tokens]
-        num_valid_pages.copy_(positions[:num_tokens] // PAGE_SIZE + 1)
-        if common_attn_metadata.dcp_local_seq_lens is not None:
-            # DCP currently forces uniform single-token decode. Decode rows are
-            # first, so each row's causal bound is its rank-local request length.
-            assert num_decode_tokens == num_decodes
-            local_decode_seq_lens = minimax_m3_decode_seq_lens(
-                common_attn_metadata, num_decodes
-            )
-            num_valid_pages[:num_decode_tokens].copy_(
-                (local_decode_seq_lens + PAGE_SIZE - 1) // PAGE_SIZE
+        if self.dcp_world_size > 1:
+            num_valid_pages.copy_(global_num_valid_pages)
+        if self.dcp_world_size > 1 and num_tokens > 0:
+            write_dcp_local_seq_lens(
+                positions[:num_tokens],
+                num_valid_pages[:num_tokens],
+                global_offset=1,
+                dcp_rank=self.dcp_rank,
+                dcp_world_size=self.dcp_world_size,
+                interleave_size=self.cp_kv_cache_interleave_size,
+                output_block_size=PAGE_SIZE,
             )
 
         # Unified score buffer: a per-forward view of the persistent buffer,
@@ -216,15 +267,31 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             qsl_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
             qo_lens_cpu = (qsl_cpu[1:] - qsl_cpu[:-1]).to(torch.int32)
             kv_lens_cpu = seq_lens[:num_reqs].cpu().to(torch.int32)
-            nvp = (kv_lens_cpu + PAGE_SIZE - 1) // PAGE_SIZE
             side_qo = qo_lens_cpu[lo:hi]
             side_kv = kv_lens_cpu[lo:hi]
+            side_qo_offset = side_kv - side_qo
+            page_table_rows = block_table[lo:hi]
+            if self.dcp_world_size > 1:
+                segments = minimax_m3_dcp_prefill_segments(
+                    qsl_cpu,
+                    kv_lens_cpu,
+                    num_decodes=num_decodes,
+                    dcp_rank=self.dcp_rank,
+                    dcp_world_size=self.dcp_world_size,
+                    interleave_size=self.cp_kv_cache_interleave_size,
+                )
+                side_qo = segments.query_lens
+                side_kv = segments.kv_lens
+                side_qo_offset = segments.query_offsets
+                page_table_rows = page_table_rows.index_select(
+                    0, segments.request_indices.to(page_table_rows.device)
+                )
             plan = _fmha_sm100_plan(
                 side_qo,
                 side_kv,
                 self.num_index_heads,
                 num_kv_heads=1,
-                qo_offset=side_kv - side_qo,  # bottom-right causal
+                qo_offset=side_qo_offset,
                 page_size=PAGE_SIZE,
                 output_maxscore=True,
                 causal=True,
@@ -236,15 +303,21 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             # plan's natural value, so the extra tiles are simply never written.
             plan["max_k_tiles"] = max_k_tiles
             cols = torch.arange(block_table.shape[1], device=block_table.device)
-            valid = cols[None, :] < nvp[lo:hi].to(block_table.device)[:, None]
+            side_nvp = (side_kv + PAGE_SIZE - 1) // PAGE_SIZE
+            valid = cols[None, :] < side_nvp.to(block_table.device)[:, None]
             prefill = MiniMaxM3IndexerMSAPrefillMetadata(
                 plan=plan,
-                cu_seqlens_q=(query_start_loc[lo : hi + 1] - query_start_loc[lo]).to(
-                    torch.int32
+                cu_seqlens_q=torch.cat(
+                    (
+                        torch.zeros(
+                            1, dtype=torch.int32, device=query_start_loc.device
+                        ),
+                        side_qo.to(query_start_loc.device).cumsum(0, dtype=torch.int32),
+                    )
                 ),
                 prefix_lens=context_lens[lo:hi],
                 max_query_len=int(side_qo.max()),
-                page_table=block_table[lo:hi][valid].to(torch.int32),
+                page_table=page_table_rows[valid].to(torch.int32),
             )
 
         return MiniMaxM3IndexerMSAMetadata(
@@ -264,6 +337,9 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             topk_prefix_lens=context_lens,
             topk_max_query_len=common_attn_metadata.max_query_len,
             topk_num_valid_pages=num_valid_pages,
+            topk_num_global_valid_pages=global_num_valid_pages,
+            dcp_packed_candidates=self.dcp_packed_candidates_buffer,
+            decode_positions=positions[:num_decode_tokens],
         )
 
 
@@ -281,6 +357,10 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
             return None, None  # profiling run; caches unbound
         md = attn_metadata[self.index_cache.prefix]
         assert isinstance(md, MiniMaxM3IndexerMSAMetadata)
+        # Forward also runs while vLLM profiles CUDA-graph memory, outside the
+        # set_current_vllm_config() context. The initialized DCP process group
+        # is the runtime source of truth and is safe in that path.
+        dcp_world_size = get_dcp_group().world_size
 
         num_tokens = md.num_actual_tokens
         nd = md.num_decode_tokens
@@ -307,25 +387,39 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
         # writes by strides). Top-k is deferred to the single unified call below.
         if md.decode is not None:
             d = md.decode
+            active_num_decodes = nd // d.decode_query_len
+            assert active_num_decodes * d.decode_query_len == nd
             # max_decode_query_len avoids recompiles across runtime decode sizes.
             # Fall back when the flattened Q tile gets too wide for this kernel.
+            use_dcp_token_positions = dcp_world_size > 1 and d.decode_query_len > 1
             decode_score = (
                 minimax_m3_index_decode_score_cutedsl
-                if self.num_index_heads * d.max_decode_query_len <= 32
+                if not use_dcp_token_positions
+                and self.num_index_heads * d.max_decode_query_len <= 32
                 else minimax_m3_index_decode_score
             )
+            score_kwargs = {}
+            if use_dcp_token_positions:
+                assert md.decode_positions is not None
+                score_kwargs = {
+                    "query_positions": md.decode_positions,
+                    "dcp_rank": get_dcp_group().rank_in_group,
+                    "dcp_world_size": dcp_world_size,
+                    "dcp_interleave_size": PAGE_SIZE,
+                }
             decode_score(
                 index_q[:nd],
                 kv,
-                d.block_table,
-                d.seq_lens,
+                d.block_table[:active_num_decodes],
+                d.seq_lens[:active_num_decodes],
                 d.max_seq_len,
-                self.init_blocks,
-                self.local_blocks,
+                0 if dcp_world_size > 1 else self.init_blocks,
+                0 if dcp_world_size > 1 else self.local_blocks,
                 self.num_kv_heads,
                 d.decode_query_len,
                 d.max_decode_query_len,
                 score_out=unified_scores[:nd].transpose(0, 1),
+                **score_kwargs,
             )
 
         if md.prefill_msa is not None:
@@ -349,21 +443,72 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
                 max_score=unified_scores[nd:],
             )
 
-        # Single top-k over the unified buffer via fmha_sm100 sparse_topk_select
-        # (THK, no transpose) into ``buf``. num_valid_pages drives force_end_blocks
-        # (always keep each token's local block; fmha OnlyScore won't) + the -1
-        # out-of-range clamp.
+        # Select top-k through fmha_sm100 sparse_topk_select (THK, no transpose).
+        # DCP first selects rank-local candidates, exchanges only those
+        # candidates, and writes each rank's subset of the exact global top-k.
         from vllm.third_party.fmha_sm100.api import sparse_topk_select
 
-        sparse_topk_select(
-            unified_scores,
-            self.topk_blocks,
-            num_valid_pages=md.topk_num_valid_pages,
-            force_begin_blocks=self.init_blocks,
-            force_end_blocks=self.local_blocks,
-            output=buf[:num_tokens],
-            max_score_layout="THK",
-        )
+        if dcp_world_size > 1 and num_tokens > 0:
+            assert self.num_index_heads == 1
+            dcp_rank = get_dcp_group().rank_in_group
+            local_scores = unified_scores[:num_tokens].reshape(-1, md.max_k_tiles)
+            global_valid_pages = md.topk_num_global_valid_pages
+            local_valid_pages = md.topk_num_valid_pages
+            assert global_valid_pages is not None
+            assert local_valid_pages is not None
+            force_dcp_global_blocks(
+                local_scores,
+                global_valid_pages[:num_tokens],
+                dcp_rank=dcp_rank,
+                dcp_world_size=dcp_world_size,
+                init_blocks=self.init_blocks,
+                local_blocks=self.local_blocks,
+            )
+            local_output = buf[:num_tokens].reshape(-1, self.topk_blocks)
+            sparse_topk_select(
+                unified_scores[:num_tokens],
+                self.topk_blocks,
+                num_valid_pages=local_valid_pages[:num_tokens],
+                force_begin_blocks=0,
+                force_end_blocks=0,
+                output=buf[:num_tokens],
+                max_score_layout="THK",
+            )
+
+            packed = md.dcp_packed_candidates
+            assert packed is not None
+            packed = packed[: local_scores.shape[0]]
+            from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
+                pack_dcp_topk_candidates_cutedsl,
+            )
+
+            pack_dcp_topk_candidates_cutedsl(
+                local_scores,
+                local_output,
+                packed,
+                dcp_rank,
+                dcp_world_size,
+                1,  # one sparse block is one DCP ownership/interleave unit
+                None,
+            )
+            gathered = get_dcp_group().all_gather(packed, dim=1)
+            merge_filter_dcp_topk(
+                gathered,
+                local_output,
+                dcp_rank=dcp_rank,
+                dcp_world_size=dcp_world_size,
+            )
+
+        else:
+            sparse_topk_select(
+                unified_scores,
+                self.topk_blocks,
+                num_valid_pages=md.topk_num_valid_pages,
+                force_begin_blocks=self.init_blocks,
+                force_end_blocks=self.local_blocks,
+                output=buf[:num_tokens],
+                max_score_layout="THK",
+            )
 
         # The attend reads ``buf`` directly; this return is vestigial.
         return None, None

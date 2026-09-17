@@ -165,6 +165,58 @@ def test_piecewise_capture_uses_pcp_dummy_slot_mappings():
     block_tables.get_dummy_slot_mappings.assert_not_called()
 
 
+def test_dcp_capture_dummy_spans_one_ownership_cycle():
+    num_reqs = 2
+    num_tokens = 8
+    input_buffers = InputBuffers(num_reqs, num_tokens, torch.device("cpu"))
+
+    block_tables = MagicMock()
+    block_tables.cp_size = 2
+    block_tables.cp_rank = 0
+    block_tables.cp_interleave = 128
+    block_tables.input_block_tables = (torch.zeros(num_reqs, 4, dtype=torch.int32),)
+    block_tables.kernel_block_sizes = (128,)
+    block_tables.blocks_per_kv_block = (1,)
+    block_tables.get_dummy_block_tables.return_value = block_tables.input_block_tables
+    block_tables.get_dummy_slot_mappings.return_value = torch.zeros(
+        1, num_tokens, dtype=torch.int64
+    )
+
+    model_state = MagicMock()
+    model_state.prepare_attn.return_value = {}
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[],
+    )
+
+    with patch.object(gpu_cudagraph_utils, "prepare_dcp_local_seq_lens"):
+        gpu_cudagraph_utils.prepare_inputs_to_capture(
+            num_reqs,
+            num_tokens,
+            model_state,
+            input_buffers,
+            block_tables,
+            [],
+            kv_cache_config,
+            full_cudagraph=False,
+            max_model_len=1024,
+        )
+
+    input_batch = model_state.prepare_attn.call_args.args[0]
+    expected_seq_lens = torch.full((num_reqs,), 260, dtype=torch.int32)
+    assert torch.equal(input_batch.seq_lens, expected_seq_lens)
+    assert torch.equal(input_batch.seq_lens_cpu_upper_bound, expected_seq_lens)
+    assert torch.equal(
+        input_batch.positions,
+        torch.tensor([256, 257, 258, 259] * num_reqs, dtype=torch.int64),
+    )
+    assert torch.equal(
+        block_tables.input_block_tables[0][:, :3],
+        torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32),
+    )
+
+
 _DECODE_QUERY_LEN = 3
 
 

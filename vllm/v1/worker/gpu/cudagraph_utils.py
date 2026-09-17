@@ -39,7 +39,7 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, set_dummy_context
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
 
@@ -568,6 +568,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 attn_groups,
                 kv_cache_config,
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
+                max_model_len=self.vllm_config.model_config.max_model_len,
                 max_query_len=desc.max_query_len,
                 pcp_manager=pcp_manager,
             )
@@ -661,12 +662,28 @@ def prepare_inputs_to_capture(
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
     full_cudagraph: bool,
+    max_model_len: int | None = None,
     max_query_len: int | None = None,
     pcp_manager: "PCPManager | None" = None,
 ) -> AttentionState:
     input_batch = InputBatch.make_dummy(
         num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
     )
+    if block_tables.cp_size > 1:
+        # DCP capture must exercise both KV owners. With zero-context dummy
+        # requests, every token belongs to rank 0 for capture shapes shorter
+        # than one interleave, and rank-local sparse metadata can degenerate
+        # to an empty shard. Give each request one full DCP ownership cycle of
+        # valid synthetic context before deriving block tables and local
+        # lengths. This work is outside the graph and does not affect replay.
+        assert max_model_len is not None
+        set_dummy_context(
+            input_batch,
+            block_tables,
+            block_tables.cp_size * block_tables.cp_interleave,
+            kv_cache_config.num_blocks,
+            max_model_len,
+        )
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
     slot_mapping_provider: BlockTables | PCPManager = block_tables
     if pcp_manager is not None:

@@ -298,6 +298,7 @@ def _decode_index_score_kernel(
     score_ptr,  # [num_idx_heads, total_q, max_block]
     block_table_ptr,  # [num_reqs, max_blocks]
     seq_lens,  # [num_reqs]
+    query_positions,  # [total_q], used only for DCP
     num_idx_heads: tl.constexpr,
     head_dim: tl.constexpr,
     init_blocks,
@@ -317,6 +318,10 @@ def _decode_index_score_kernel(
     BLOCK_SIZE_Q: tl.constexpr,
     num_kv_chunks,
     USE_PDL: tl.constexpr,
+    HAS_DCP_POSITIONS: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_INTERLEAVE_SIZE: tl.constexpr,
 ):
     BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
     pid_r = tl.program_id(0)
@@ -331,11 +336,23 @@ def _decode_index_score_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    seq_len = tl.load(seq_lens + pid_r)
-    query_pos = seq_len - decode_query_len + q_offsets
-    # Full-CG padding uses zero-length request rows. Clamp to an empty
-    # attention range instead of letting padded rows produce negative lengths.
-    kv_len = tl.maximum(query_pos + 1, 0)
+    if HAS_DCP_POSITIONS:
+        global_kv_len = tl.load(query_positions + q_ids, mask=q_mask, other=-1) + 1
+        base = (
+            global_kv_len // DCP_INTERLEAVE_SIZE // DCP_WORLD_SIZE * DCP_INTERLEAVE_SIZE
+        )
+        remainder = global_kv_len - base * DCP_WORLD_SIZE
+        remainder = tl.minimum(
+            tl.maximum(remainder - DCP_RANK * DCP_INTERLEAVE_SIZE, 0),
+            DCP_INTERLEAVE_SIZE,
+        )
+        kv_len = tl.maximum(base + remainder, 0)
+    else:
+        seq_len = tl.load(seq_lens + pid_r)
+        query_pos = seq_len - decode_query_len + q_offsets
+        # Full-CG padding uses zero-length request rows. Clamp to an empty
+        # attention range instead of letting padded rows produce negative lengths.
+        kv_len = tl.maximum(query_pos + 1, 0)
     num_blocks_q = (kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
     kv_len_max = tl.max(tl.where(q_mask, kv_len, 0), axis=0)
     num_blocks = (kv_len_max + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
@@ -769,6 +786,10 @@ def minimax_m3_index_decode_score(
     decode_query_len: int,
     max_decode_query_len: int,
     score_out: torch.Tensor | None = None,
+    query_positions: torch.Tensor | None = None,
+    dcp_rank: int = 0,
+    dcp_world_size: int = 1,
+    dcp_interleave_size: int = 1,
 ) -> torch.Tensor:
     """Decode index block-score (split-K, cudagraph-safe); no top-k.
 
@@ -830,6 +851,7 @@ def minimax_m3_index_decode_score(
         score,
         block_table,
         seq_lens,
+        query_positions,
         num_idx_heads,
         head_dim,
         init_blocks,
@@ -849,6 +871,10 @@ def minimax_m3_index_decode_score(
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         num_kv_chunks=num_kv_chunks,
         USE_PDL=use_pdl,
+        HAS_DCP_POSITIONS=query_positions is not None,
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
+        DCP_INTERLEAVE_SIZE=dcp_interleave_size,
         **score_kwargs,
     )
     return score
